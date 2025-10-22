@@ -1,0 +1,189 @@
+
+#include "INA226.h"
+#include <Wire.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+
+// --- WiFi Credentials ---
+char ssid[] = "hotspot";
+char pass[] = "123456789";
+
+// --- Supabase REST API ---
+const char* SUPABASE_URL = "https://tnqblqzwrvgszvdwupjb.supabase.co";
+const char* SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRucWJscXp3cnZnc3p2ZHd1cGpiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjA4OTM3MTUsImV4cCI6MjA3NjQ2OTcxNX0.5FbQGMxlEL0ncX5R5z_3pkj3p7IKxyu0EeAkuuzwifc";
+
+// --- INA226 Sensor ---
+INA226 INA(0x40);
+
+// --- ESP32-C3 Pin Configuration ---
+#define SDA_PIN        8    // SDA → GPIO 8
+#define SCL_PIN        9    // SCL → GPIO 9
+#define BATT_PIN       0    // Battery ADC → GPIO 0 (ADC1_CH0)
+#define RELAY_PIN     10    // Relay → GPIO 10 (safe digital output)
+
+// --- Relay Control Thresholds ---
+#define VOLTAGE_ON   5.5
+#define VOLTAGE_OFF  4.0
+bool relayState = false;
+
+// Step size assumption (1 mV per step)
+#define STEP_SIZE 0.001  
+
+// --- Smoothing/Hysteresis Variables ---
+static int displayedBattPercent = -1; 
+const int HYSTERESIS_THRESHOLD = 2; 
+
+// --- Bus Voltage Smoothing Variables ---
+static float smoothedBusVoltage = 0.0; 
+const float LPF_ALPHA = 0.1; // 10% new, 90% old
+
+// --- Voltage Divider Values ---
+const float R1 = 100000.0; // 100kΩ
+const float R2 = 100000.0; // 100kΩ (equal = divide by 2)
+
+unsigned long lastUpdateTime = 0;
+const unsigned long UPDATE_INTERVAL = 1000; // 1 second
+
+// Forward declaration
+void sendToSupabase(float voltage, long steps, int battPercent);
+
+// ================================================================
+// --- Battery Percentage Lookup Function ---
+// ================================================================
+int getBatteryPercentage(float v) {
+  if (v >= 4.20) return 100;
+  if (v <= 3.30) return 0;
+
+  const float voltageTable[] = {4.20, 4.10, 3.95, 3.85, 3.80, 3.75, 3.70, 3.65, 3.55, 3.45, 3.30};
+  const int   percentTable[] = {100,  90,   80,   70,   60,   50,   40,   30,   20,   10,   0};
+
+  for (int i = 0; i < 10; i++) {
+    if (v <= voltageTable[i] && v > voltageTable[i + 1]) {
+      float vHigh = voltageTable[i];
+      float vLow  = voltageTable[i + 1];
+      float pHigh = percentTable[i];
+      float pLow  = percentTable[i + 1];
+      float percent = pLow + (pHigh - pLow) * ((v - vLow) / (vHigh - vLow));
+      return constrain(round(percent), 0, 100);
+    }
+  }
+  return 0;
+}
+
+// ================================================================
+// --- Send data to Supabase ---
+// ================================================================
+void sendToSupabase(float voltage, long steps, int battPercent) {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  String url = String(SUPABASE_URL) + "/rest/v1/footstep_data_2";
+  http.begin(url);
+  http.addHeader("apikey", SUPABASE_KEY);
+  http.addHeader("Authorization", "Bearer " + String(SUPABASE_KEY));
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Prefer", "return=minimal");
+
+  String payload = String("{\"bus_voltage\":") + voltage +
+                   ",\"remaining_steps\":" + steps +
+                   ",\"battery_percent\":" + battPercent + "}";
+
+  int httpResponseCode = http.POST(payload);
+  if (httpResponseCode > 0) {
+    Serial.printf("✅ Data sent to Supabase (HTTP %d)\n", httpResponseCode);
+  } else {
+    Serial.printf("❌ Failed to send data: %s\n", http.errorToString(httpResponseCode).c_str());
+  }
+  http.end();
+}
+
+// ================================================================
+// --- Setup ---
+// ================================================================
+void setup() {
+  Serial.begin(115200);
+  Serial.println("ESP32-C3 Footstep Power System Starting...");
+
+  // --- WiFi ---
+  WiFi.begin(ssid, pass);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
+  }
+  Serial.println("\n✅ WiFi Connected!");
+
+  // --- Relay setup ---
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW);
+
+  // --- INA226 setup ---
+  Wire.begin(SDA_PIN, SCL_PIN);
+  if (!INA.begin()) {
+    Serial.println("❌ INA226 Initialization Error!");
+    while (1);
+  }
+  INA.setMaxCurrentShunt(1, 0.002);
+  smoothedBusVoltage = INA.getBusVoltage(); // Prime LPF
+}
+
+// ================================================================
+// --- Main Loop ---
+// ================================================================
+void loop() {
+  float rawBusVoltage = INA.getBusVoltage();
+
+  // --- Low-Pass Filter ---
+  smoothedBusVoltage = (LPF_ALPHA * rawBusVoltage) + ((1.0 - LPF_ALPHA) * smoothedBusVoltage);
+
+  // --- Relay Control ---
+  if (!relayState && smoothedBusVoltage >= VOLTAGE_ON) {
+    digitalWrite(RELAY_PIN, HIGH);
+    relayState = true;
+    Serial.println("🔋 Relay ON: Capacitor connected");
+  } else if (relayState && smoothedBusVoltage <= VOLTAGE_OFF) {
+    digitalWrite(RELAY_PIN, LOW);
+    relayState = false;
+    Serial.println("⚡ Relay OFF: Capacitor disconnected");
+  }
+
+  // --- Remaining Steps ---
+  long remainingSteps = 0;
+  if (smoothedBusVoltage < 5.5) {
+    remainingSteps = (long)((5.5 - smoothedBusVoltage) / STEP_SIZE);
+  }
+
+  // --- Battery Voltage Measurement ---
+  float total = 0;
+  for (int i = 0; i < 100; i++) total += analogRead(BATT_PIN);
+  float avgRaw = total / 100.0;
+
+  // ESP32-C3 ADC reference ~3.3V to 3.6V depending on calibration
+  float vMeasured = (avgRaw / 4095.0) * 3.6;  
+  float battVolt = vMeasured * ((R1 + R2) / R2);  // Divider compensation
+
+  int battPercent = getBatteryPercentage(battVolt);
+
+  // --- Battery Hysteresis ---
+  if (displayedBattPercent == -1) displayedBattPercent = battPercent;
+  else if (battPercent == 0 || battPercent == 100) displayedBattPercent = battPercent;
+  else if (abs(battPercent - displayedBattPercent) >= HYSTERESIS_THRESHOLD)
+    displayedBattPercent = battPercent;
+
+  // --- Send Data to Supabase (every 1s) ---
+  if (millis() - lastUpdateTime >= UPDATE_INTERVAL) {
+    lastUpdateTime = millis();
+    sendToSupabase(smoothedBusVoltage, remainingSteps, displayedBattPercent);
+  }
+
+  // --- Debug Info ---
+  Serial.print("Raw Bus Voltage: "); Serial.print(rawBusVoltage, 3); Serial.println(" V");
+  Serial.print("Smoothed Bus Voltage: "); Serial.print(smoothedBusVoltage, 3); Serial.println(" V");
+  Serial.print("Remaining Steps: "); Serial.println(remainingSteps);
+  Serial.print("Relay: "); Serial.println(relayState ? "ON" : "OFF");
+  Serial.print("Battery Voltage: "); Serial.print(battVolt, 2); Serial.println(" V");
+  Serial.print("Battery Percent: "); Serial.print(displayedBattPercent); Serial.println(" %");
+  Serial.println("----------------------------");
+
+  delay(500);
+}
